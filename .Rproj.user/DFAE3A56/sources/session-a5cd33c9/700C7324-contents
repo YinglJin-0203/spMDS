@@ -1,0 +1,121 @@
+## =============================================================
+## MM-ADMM Algorithm for Splines-based Multidimensional Scaling
+## =============================================================
+## Implements the algorithm derived in "MM algorithm of MDS"
+##
+## Model:
+##   c^t_i  = embedding of node i at time t (1 x D)
+##   C_t    = Phi_t %*% B                    (P x D)
+##   Phi_t  = t(phi_t) %x% I_P                (P x PK)
+##   B      = stacked spline coefficients     (PK x D)
+##
+## Objective:
+##   o(B) = sum_t sum_{i<=j} (delta_ij_t - ||c_i_t - c_j_t||)^2 + lambda*||B||_1
+##
+## Majorized via Guttman transform (MM step), then the resulting
+## penalized least-squares problem is solved via ADMM (LASSO-type step).
+## =============================================================
+
+library(Matrix)
+
+
+
+
+
+
+## -------------------------------------------------------------
+## 9. Main driver: MM + ADMM combined algorithm (Algorithm 1)
+## -------------------------------------------------------------
+#' @title Fit Splines MDS via MM-ADMM
+#'
+#' @param delta_list list of T dissimilarity matrices (P x P each)
+#' @param phi_list   list of T spline basis vectors (K x 1 each)
+#' @param P number of nodes
+#' @param K number of spline basis functions
+#' @param D embedding dimension
+#' @param lambda L1 penalty weight
+#' @param rho ADMM penalty parameter
+#' @param admm_iter number of inner ADMM iterations per MM step
+#' @param max_iter maximum number of outer MM iterations
+#' @param tol relative convergence tolerance on the objective
+#' @param B_init optional initial value for B (PK x D); random if NULL
+#' @param verbose print progress
+#'
+#' @return list with final B, embedding trajectories C_list, and
+#'         objective value history
+spMDS <- function(delta_list, phi_list, P, K, D,
+                            lambda = 0.1, rho = 1,
+                            admm_iter = 20, max_iter = 100,
+                            tol = 1e-6, B_init = NULL, verbose = TRUE) {
+
+  T_len <- length(delta_list)
+  PK <- P * K
+
+  # Precompute Phi_t for all t (fixed across the whole algorithm)
+  Phi_list <- lapply(phi_list, function(phi_t) build_Phi_t(phi_t, P))
+
+  # Precompute sum_t Phi_t' Phi_t once (does not depend on B or m)
+  PtP_sum <- Reduce(`+`, lapply(Phi_list, function(Phi_t) t(Phi_t) %*% Phi_t))
+
+  # Initialize B, Z, Y
+  if (is.null(B_init)) {
+    B <- matrix(rnorm(PK * D, sd = 0.1), PK, D)
+  } else {
+    B <- B_init
+  }
+  Z <- B
+  Y <- matrix(0, PK, D)
+
+  obj_history <- numeric(max_iter + 1)
+  obj_history[1] <- compute_objective(delta_list, Phi_list, B, lambda)
+
+  B_prev_outer <- B  # B^(m-1) used inside the W_t / surrogate step
+
+  for (m in 1:max_iter) {
+
+    ## ---- MM step: compute W_t at current B (Guttman transform) ----
+    Ct_list <- compute_Ct_list(Phi_list, B_prev_outer)
+    Wt_list <- vector("list", T_len)
+    for (t in 1:T_len) {
+      d_t <-   as.matrix(dist(Ct_list[[t]]))
+      Wt_list[[t]] <- compute_Wt(delta_list[[t]], d_t)
+    }
+
+    ## ---- ADMM inner loop: solve the majorized penalized LS problem ----
+    for (inner in 1:admm_iter) {
+      B <- update_B(Phi_list, Wt_list, B_prev_outer, Y, Z, rho, PtP_sum, PK)
+      Z <- update_Z(B, Y, rho, lambda)
+      Y <- update_Y(Y, B, Z, rho)
+    }
+
+    ## ---- Evaluate objective and check convergence ----
+    obj_val <- compute_objective(delta_list, Phi_list, B, lambda)
+    obj_history[m + 1] <- obj_val
+
+    rel_change <- abs(obj_val - obj_history[m]) / abs(obj_val)
+
+    if (verbose) {
+      cat(sprintf("Iter %d: objective = %.6f, rel change = %.2e\n",
+                  m, obj_val, rel_change))
+    }
+
+    if (rel_change < tol) {
+      obj_history <- obj_history[1:(m + 1)]
+      break
+    }
+
+    B_prev_outer <- B
+  }
+
+  Ct_final <- compute_Ct_list(Phi_list, B)
+
+  return(list(
+    B = B,
+    Z = Z,
+    Y = Y,
+    C_list = Ct_final,
+    objective_history = obj_history,
+    Phi_list = Phi_list
+  ))
+}
+
