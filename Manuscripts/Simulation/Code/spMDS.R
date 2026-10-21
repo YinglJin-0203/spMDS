@@ -15,59 +15,8 @@ set.seed(123)
 df <- read_rds("Manuscripts/Simulation/Data/Data_P9_T100_N100.rds")
 head(df)
 
-# dissimilarity
-delta_list <- df %>% select(-subject) %>% group_by(time) %>%
-  group_map(~cor(.x), method = "spearman")
-delta_list <- lapply(delta_list, function(x){1-abs(x)})
 
-# splines basis
-nT <- length(delta_list)
-K <- 30
-P <- dim(delta_list[[1]])[1]
-knots <- seq(0, nT, length.out = K - 2)[-c(1, K - 2)]
-basis_obj <- bs(1:nT, degree = 3, knots = knots, intercept = TRUE)
-phi_list <- lapply(1:nT, function(t) as.numeric(basis_obj[t, ]))
-
-
-#### Test functions ####
-Phit <- build_Phi_t(phi_list[[2]], P)
-dim(Phit)
-View(Phit)
-
-Phi_list <- lapply(phi_list, function(phi_t) build_Phi_t(phi_t, P))
-# Precompute sum_t Phi_t' Phi_t once (does not depend on B or m)
-PtP_sum <- Reduce(`+`, lapply(Phi_list, function(Phi_t) t(Phi_t) %*% Phi_t))
-
-# Initialize B, Z, Y
-PK <-P*K
-D <- 2
-B <- matrix(rnorm(PK * D, sd = 0.1), PK, D)
-Z <- B
-Y <- matrix(0, PK, D)
-
-lambda = 0.1
-
-compute_objective(delta_list, Phi_list, B, lambda)
-
-Ct_list <- compute_Ct_list(Phi_list, B)
-T_len <- length(Ct_list)
-Wt_list <- vector("list", T_len)
-for (t in 1:T_len) {
-  d_t <-   as.matrix(dist(Ct_list[[t]]))
-  Wt_list[[t]] <- compute_Wt(delta_list[[t]], d_t)
-}
-
-
-rho <- 0.1
-for (inner in 1:admm_iter) {
-  B <- update_B(Phi_list, Wt_list, B, Y, Z, rho, PtP_sum, PK)
-  Z <- update_Z(B, Y, rho, lambda, Dsum)
-  Y <- update_Y(Y, B, Z, rho)
-}
-
-spMDS_fit <- spMDS(delta_list, phi_list, P, K, 2, 0.1, 1, max_iter = 500)
-
-#### Fit model ####
+#------------------------------- Fit model ----------------------------------------
 
 # dissimilarity
 delta_list <- df %>% select(-subject) %>% group_by(time) %>%
@@ -89,6 +38,9 @@ rho_vec <- c(0.01, 0.1, 1)
 
 df_combo <- expand.grid(lambda_vec = lambda_vec, rho_vec = rho_vec)
 df_combo[ , c('stress', "movement", "time")] <- NA
+df_combo <- tibble(df_combo)
+coords_list <- list()
+
 
 # loop over rows
 for (i in 1:nrow(df_combo)) {
@@ -98,7 +50,7 @@ for (i in 1:nrow(df_combo)) {
     spMDS_fit <- spMDS(
       delta_list = delta_list,
       phi_list = phi_list,
-      penalty_type = "l1",
+      penalty_type = "temporal",
       P = P, K = K, D = 2,
       lambda = lambda, rho = rho,
       admm_iter = 15, max_iter = 1000,
@@ -109,31 +61,54 @@ for (i in 1:nrow(df_combo)) {
   df_combo[i ,"time"] <- time_i[3]
   df_combo[i , "stress"] <- tail(spMDS_fit$stress, 1)
   df_combo[i , "movement"] <- tail(spMDS_fit$movement, 1)
+  coords_list[[i]] <- spMDS_fit$C_list
 }
 
 
-#### Overall inspection ####
-spMDS_fit$C_list
+# save results
+# results_l1 <- df_combo
+# coords_l1 <- coords_list
+results_temp <- df_combo
+coords_temp <- coords_list
 
-## Plot objective trajectory
-plot(spMDS_fit$objective_history, type = "b", pch = 20,
-     xlab = "MM Iteration", ylab = "Objective value",
-     main = "Convergence of MM-ADMM Splines MDS")
+saveRDS(results_l1, file="Manuscripts/Simulation/Data/sim_result_l1.rds")
+saveRDS(coords_l1, file="Manuscripts/Simulation/Data/sim_coord_l1.rds")
 
-plot(spMDS_fit$stress[1:286])
-plot(spMDS_fit$movement[1:286])
-# network plot
+saveRDS(results_temp, file="Manuscripts/Simulation/Data/sim_result_temp.rds")
+saveRDS(coords_temp, file="Manuscripts/Simulation/Data/sim_coord_temp.rds")
+
+# ---------------------- Overall stress and movement -----------------------------------
+results_l1$penalty = "l1"
+results_temp$penalty = "temporal"
+
+library(kableExtra)
+
+left_join(results_l1, results_temp, by = c("lambda_vec", "rho_vec"), suffix = c("_l1", "_temp") ) %>%
+  select(time_l1, time_temp) %>%
+  kable() %>%
+  kable_styling()
+
+
+results_l1$stress
+
+
+
+
+
+# ------------------------- Network plot ---------------------------------------
+
 inet <- make_empty_graph(n=P, directed = F)
 net_list <- list()
 
 for (t in seq_len(nT)) {
-  layout_mat <- cbind(spMDS_fit$C_list[[t]])
+  # layout_mat <- coords_l1[[5]][[t]]
+  layout_mat <- coords_temp[[5]][[t]]
   png(filename = "Manuscripts/Simulation/Figures/snapshot.png")
   plot(inet, layout = layout_mat,
        vertex.size = 30,
        vertex.label.cex = 2,
        vertex.label.color = "black",
-       main = paste0("t =", t, ", lambda = ", 0.5, ", rho = ", 1))
+       main = paste0("t =", t, ", lambda = ", 0.1, ", rho = ", 0.1, ", temporal"))
   dev.off()
 
   net_list[[t]] <- image_read("Manuscripts/Simulation/Figures/snapshot.png")
@@ -148,7 +123,7 @@ net_gif
 
 ## save to disk
 image_write(image = net_gif,
-            path = "Manuscripts/Simulation/Figures/GIF_N100_P9_T100_lambda0.5_rho0.1.gif")
+            path = "Manuscripts/Simulation/Figures/GIF_N100_P9_T100_lambda0.1_rho0.1_temporal.gif")
 
 
 # stress and regularization
